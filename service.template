@@ -1,0 +1,12 @@
+[Unit]
+Description=Servicio Hestia
+After=network.target
+
+[Service]
+User=server
+WorkingDirectory=/home/server/hestia
+ExecStart=/home/server/hestia/venv/bin/python monitor.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
