@@ -3,7 +3,7 @@ import docker
 import os
 
 
-CHECK_INTERVAL = 60  # segundos
+CHECK_INTERVAL = 20  # segundos
 
 
 def clear_console():
@@ -69,14 +69,20 @@ def check_and_update_containers(client):
             continue
 
         print(f"Verificando la imagen del contenedor {container.name}: {image_name}")
-        up_to_date, current_hash, latest_hash = is_image_up_to_date(client, container, image_name)
+        up_to_date, current_hash, latest_hash = is_image_up_to_date(
+            client, container, image_name
+        )
 
         if up_to_date is None:
             print(f"No se pudo verificar la imagen del contenedor {container.name}.")
         elif up_to_date:
-            print(f"La imagen del contenedor {container.name} ({image_name}) está al día.")
+            print(
+                f"La imagen del contenedor {container.name} ({image_name}) está al día."
+            )
         else:
-            print(f"La imagen del contenedor {container.name} ({image_name}) NO está al día.")
+            print(
+                f"La imagen del contenedor {container.name} ({image_name}) NO está al día."
+            )
             try:
                 print(f"Actualizando y reiniciando el contenedor {container.name}...")
 
@@ -99,7 +105,9 @@ def check_and_update_containers(client):
                     environment=environment,
                     restart_policy={"Name": "always"},
                 )
-                print(f"Contenedor {container.name} reiniciado con la imagen actualizada.")
+                print(
+                    f"Contenedor {container.name} reiniciado con la imagen actualizada."
+                )
 
                 # Eliminar imagen vieja
                 print(f"Eliminando la imagen antigua: {current_hash}")
