@@ -1,0 +1,11 @@
+{
+  "interval": 60,
+  "health_timeout": 120,
+  "stop_timeout": 20,
+  "containers": [
+    {
+      "name": "zeta-ka-prueba",
+      "image": "ghcr.io/simon1494/zeta-ka:latest"
+    }
+  ]
+}

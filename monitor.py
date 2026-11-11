@@ -1,449 +1,356 @@
-import time
-import docker
+"""Update explicitly selected Docker containers, with health checks and recovery."""
+
+import argparse
+from contextlib import contextmanager
+from copy import deepcopy
+import json
+import logging
 import os
+from pathlib import Path
+import signal
+import threading
+import time
+import uuid
+
+import docker
+from docker.errors import NotFound
 
 
-CHECK_INTERVAL = 20  # segundos
+LOG = logging.getLogger("hestia")
+TRANSACTION_LABEL = "io.hestia.transaction"
 
 
-def clear_console():
-    os.system("cls" if os.name == "nt" else "clear")
+class UpdateError(RuntimeError):
+    pass
 
 
-def is_image_up_to_date(client, container, image_name):
-    try:
-        latest_image = client.images.pull(image_name)
-        latest_hash = latest_image.id
-        current_hash = container.image.id
-        return current_hash == latest_hash, current_hash, latest_hash
-    except Exception as e:
-        print(f"Error al verificar actualizaciones para {image_name}: {e}")
-        return None, None, None
+def load_config(path):
+    config = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    targets = config.get("containers", [])
+    if not targets or not isinstance(targets, list):
+        raise ValueError("Configure at least one container in 'containers'.")
+    names = set()
+    for target in targets:
+        name = target.get("name")
+        if not isinstance(name, str) or not name or name in names:
+            raise ValueError("Each container needs a unique, nonempty name.")
+        if "image" in target and (not isinstance(target["image"], str) or not target["image"]):
+            raise ValueError("The optional image reference must be a nonempty string.")
+        names.add(name)
+    for key, default in (("interval", 60), ("health_timeout", 120), ("stop_timeout", 20)):
+        config.setdefault(key, default)
+        if not isinstance(config[key], (int, float)) or config[key] <= 0:
+            raise ValueError(f"{key} must be positive.")
+    return config
 
 
-def extract_ports(container):
-    ports = {}
-    port_bindings = container.attrs["HostConfig"].get("PortBindings", {})
-    for container_port, bindings in port_bindings.items():
-        host_port = bindings[0].get("HostPort")
-        if host_port:
-            ports[container_port] = int(host_port)
-    return ports
+class State:
+    """Durable journal; no container environment or registry secrets are stored."""
 
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.path = self.directory / "state.json"
+        self.data = json.loads(self.path.read_text()) if self.path.exists() else {
+            "transaction": None, "failed_images": {}
+        }
 
-def extract_volumes(container):
-    volumes = {}
-    for mount in container.attrs.get("Mounts", []):
-        source = mount.get("Source")
-        target = mount.get("Destination")
-        mode = mount.get("Mode", "rw")
-        if source and target:
-            volumes[source] = {"bind": target, "mode": mode}
-    return volumes
-
-
-def check_and_update_containers(client):
-    print("Contenedores en ejecución:")
-    containers = client.containers.list()
-    if not containers:
-        print("No hay contenedores en ejecución.")
-        return
-
-    for container in containers:
-        if container.name == "monitor":
-            continue
-        image_name = container.image.tags[0] if container.image.tags else None
-        if not image_name:
-            print(f"El contenedor {container.name} no tiene una imagen etiquetada.")
-        else:
-            print(f"- {container.name}: {image_name} [IMAGEN]")
-
-    print()
-    for container in containers:
-        if container.name == "monitor":
-            continue
-
-        image_name = container.image.tags[0] if container.image.tags else None
-        if not image_name:
-            print(f"El contenedor {container.name} no tiene una imagen etiquetada.")
-            continue
-
-        print(f"Verificando la imagen del contenedor {container.name}: {image_name}")
-        up_to_date, current_hash, latest_hash = is_image_up_to_date(
-            client, container, image_name
-        )
-
-        if up_to_date is None:
-            print(f"No se pudo verificar la imagen del contenedor {container.name}.")
-        elif up_to_date:
-            print(
-                f"La imagen del contenedor {container.name} ({image_name}) está al día."
-            )
-        else:
-            print(
-                f"La imagen del contenedor {container.name} ({image_name}) NO está al día."
-            )
+    def save(self):
+        temporary = self.path.with_suffix(".tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(self.data, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, self.path)
+        if os.name != "nt":
+            descriptor = os.open(self.directory, os.O_RDONLY)
             try:
-                print(f"Actualizando y reiniciando el contenedor {container.name}...")
-
-                # Extraer configuración
-                ports = extract_ports(container)
-                volumes = extract_volumes(container)
-                environment = container.attrs["Config"].get("Env", [])
-
-                # Detener y eliminar
-                container.stop()
-                container.remove()
-
-                # Recrear contenedor actualizado
-                client.containers.run(
-                    image_name,
-                    detach=True,
-                    name=container.name,
-                    ports=ports,
-                    volumes=volumes,
-                    environment=environment,
-                    restart_policy={"Name": "always"},
-                )
-                print(
-                    f"Contenedor {container.name} reiniciado con la imagen actualizada."
-                )
-
-                # Eliminar imagen vieja
-                print(f"Eliminando la imagen antigua: {current_hash}")
-                client.images.remove(current_hash, force=True)
-            except Exception as e:
-                print(f"Error al actualizar el contenedor {container.name}: {e}")
-
-import time
-import docker
-import os
-from typing import Dict, Any, Tuple, Optional, List
-
-CHECK_INTERVAL = 20  # segundos
-SKIP_CONTAINERS = {"monitor"}  # contenedores a ignorar por nombre
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
 
 
-def clear_console():
-    os.system("cls" if os.name == "nt" else "clear")
-
-
-def pull_latest(client: docker.DockerClient, image_name: str):
-    # Devuelve la imagen recién descargada (o existente si ya está al día)
-    return client.images.pull(image_name)
-
-
-def image_ids_equal(a, b) -> bool:
-    return (a or "").split(":")[-1] == (b or "").split(":")[-1]
-
-
-def is_image_up_to_date(client, container, image_name) -> Tuple[Optional[bool], Optional[str], Optional[str]]:
-    try:
-        latest_image = pull_latest(client, image_name)
-        latest_hash = latest_image.id
-        current_hash = container.image.id
-        return image_ids_equal(current_hash, latest_hash), current_hash, latest_hash
-    except Exception as e:
-        print(f"[WARN] No se pudo verificar {image_name}: {e}")
-        return None, None, None
-
-
-def extract_ports(container) -> Dict[str, Any]:
-    """
-    Devuelve mapeo para docker-py: { "8000/tcp": 8000 } o { "8000/tcp": "127.0.0.1:8000" }
-    Solo aplicable cuando NO se usa network_mode=host.
-    """
-    ports = {}
-    pbind = container.attrs["HostConfig"].get("PortBindings") or {}
-    for cport, binds in pbind.items():
-        if not binds:
-            continue
-        host_ip = (binds[0].get("HostIp") or "").strip()
-        host_port = (binds[0].get("HostPort") or "").strip()
-        if not host_port:
-            continue
-        ports[cport] = int(host_port) if not host_ip else f"{host_ip}:{host_port}"
-    return ports
-
-
-def extract_volumes(container) -> Dict[str, Dict[str, str]]:
-    """
-    Devuelve { host_path: {"bind": container_path, "mode": "rw"} }
-    """
-    volumes = {}
-    for mount in container.attrs.get("Mounts", []):
-        source = mount.get("Source")
-        target = mount.get("Destination")
-        mode = mount.get("Mode", "rw")
-        if source and target:
-            volumes[source] = {"bind": target, "mode": mode}
-    return volumes
-
-
-def extract_networking(container) -> Tuple[str, Dict[str, Any]]:
-    """
-    network_mode: 'default' | 'host' | <nombre de red>
-    networks: dict con info por red (para reconectar y restaurar aliases)
-    """
-    network_mode = container.attrs["HostConfig"].get("NetworkMode") or "default"
-    networks = container.attrs["NetworkSettings"].get("Networks") or {}
-    return network_mode, networks
-
-
-def extract_full_config(container) -> Dict[str, Any]:
-    cfg = container.attrs["Config"] or {}
-    host = container.attrs["HostConfig"] or {}
-
-    # Core
-    environment = cfg.get("Env", []) or []
-    labels = cfg.get("Labels") or {}
-    user = cfg.get("User") or None
-    workdir = cfg.get("WorkingDir") or None
-    entrypoint = cfg.get("Entrypoint")
-    cmd = cfg.get("Cmd")
-    stop_timeout = container.attrs.get("StopTimeout") or host.get("StopTimeout")
-    healthcheck = cfg.get("Healthcheck")
-
-    # Logging
-    log_config = host.get("LogConfig") or {}
-    # Reinicio
-    restart_policy = host.get("RestartPolicy") or {"Name": "always"}
-
-    # Seguridad / runtime
-    cap_add = host.get("CapAdd")
-    cap_drop = host.get("CapDrop")
-    security_opt = host.get("SecurityOpt")
-    privileged = host.get("Privileged")
-    devices = host.get("Devices")
-    sysctls = host.get("Sysctls")
-    ulimits = host.get("Ulimits")
-    ipc_mode = host.get("IpcMode")
-    pid_mode = host.get("PidMode")
-    dns = host.get("Dns")
-    dns_search = host.get("DnsSearch")
-    extra_hosts = host.get("ExtraHosts")
-
-    # Red
-    network_mode, networks = extract_networking(container)
-    ports = extract_ports(container) if network_mode != "host" else {}
-    volumes = extract_volumes(container)
-
-    return {
-        "environment": environment,
-        "labels": labels,
-        "user": user,
-        "workdir": workdir,
-        "entrypoint": entrypoint,
-        "command": cmd,
-        "stop_timeout": stop_timeout,
-        "healthcheck": healthcheck,
-        "log_config": log_config,
-        "restart_policy": restart_policy,
-        "cap_add": cap_add,
-        "cap_drop": cap_drop,
-        "security_opt": security_opt,
-        "privileged": privileged,
-        "devices": devices,
-        "sysctls": sysctls,
-        "ulimits": ulimits,
-        "ipc_mode": ipc_mode,
-        "pid_mode": pid_mode,
-        "dns": dns,
-        "dns_search": dns_search,
-        "extra_hosts": extra_hosts,
-        "network_mode": network_mode,
-        "networks": networks,
-        "ports": ports,
-        "volumes": volumes,
-    }
-
-
-def build_run_kwargs(container_name: str, image_name: str, conf: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Tuple[str, List[str]]]]:
-    """
-    Prepara kwargs para client.containers.run() y una lista de redes extra para conectar luego:
-      returns (kwargs, extra_networks)
-      extra_networks: lista de (network_name, aliases)
-    """
-    kwargs: Dict[str, Any] = dict(
-        detach=True,
-        name=container_name,
-        environment=conf["environment"],
-        volumes=conf["volumes"],
-        labels=conf["labels"],
-        restart_policy=conf["restart_policy"] or {"Name": "always"},
-    )
-
-    # Opcionales
-    if conf["log_config"]:
-        kwargs["log_config"] = conf["log_config"]
-    if conf["user"]:
-        kwargs["user"] = conf["user"]
-    if conf["workdir"]:
-        kwargs["working_dir"] = conf["workdir"]
-    if conf["entrypoint"]:
-        kwargs["entrypoint"] = conf["entrypoint"]
-    if conf["command"]:
-        kwargs["command"] = conf["command"]
-    if conf["healthcheck"]:
-        kwargs["healthcheck"] = conf["healthcheck"]
-    if conf["cap_add"]:
-        kwargs["cap_add"] = conf["cap_add"]
-    if conf["cap_drop"]:
-        kwargs["cap_drop"] = conf["cap_drop"]
-    if conf["security_opt"]:
-        kwargs["security_opt"] = conf["security_opt"]
-    if conf["privileged"] is not None:
-        kwargs["privileged"] = conf["privileged"]
-    if conf["devices"]:
-        kwargs["devices"] = conf["devices"]
-    if conf["sysctls"]:
-        kwargs["sysctls"] = conf["sysctls"]
-    if conf["ulimits"]:
-        kwargs["ulimits"] = conf["ulimits"]
-    if conf["ipc_mode"]:
-        kwargs["ipc_mode"] = conf["ipc_mode"]
-    if conf["pid_mode"]:
-        kwargs["pid_mode"] = conf["pid_mode"]
-    if conf["dns"]:
-        kwargs["dns"] = conf["dns"]
-    if conf["dns_search"]:
-        kwargs["dns_search"] = conf["dns_search"]
-    if conf["extra_hosts"]:
-        kwargs["extra_hosts"] = conf["extra_hosts"]
-
-    extra_networks: List[Tuple[str, List[str]]] = []
-
-    net_mode = conf["network_mode"]
-    nets = conf["networks"] or {}
-
-    if net_mode == "host":
-        # Caso clave para tu IP real: preserva host networking
-        kwargs["network_mode"] = "host"
-    else:
-        # Si hay redes definidas, toma la primera como red principal
-        default_net = next(iter(nets.keys()), None)
-        if default_net:
-            kwargs["network"] = default_net
-        # Puertos solo si NO es host networking
-        if conf["ports"]:
-            kwargs["ports"] = conf["ports"]
-        # Resto de redes (con aliases) para conectar luego
-        for net_name, cfg in nets.items():
-            if net_name == kwargs.get("network"):
-                continue
-            aliases = cfg.get("Aliases") or []
-            extra_networks.append((net_name, aliases))
-
-    return kwargs, extra_networks
-
-
-def recreate_container(client, old_container, image_name: str, conf: Dict[str, Any], current_hash: str):
-    name = old_container.name
-    print(f"[INFO] Actualizando {name} con {image_name} ...")
-
-    kwargs, extra_nets = build_run_kwargs(name, image_name, conf)
-
-    try:
-        # Stop + remove
-        stop_timeout = conf["stop_timeout"] or 10
-        old_container.stop(timeout=stop_timeout)
-        old_container.remove()
-    except Exception as e:
-        print(f"[WARN] No se pudo detener/eliminar {name}: {e}")
-
-    # Run
-    newc = client.containers.run(image_name, **kwargs)
-    print(f"[OK] {name} re-creado.")
-
-    # Conectar redes extra (si aplica)
-    for net_name, aliases in extra_nets:
+@contextmanager
+def single_instance(directory):
+    """OS lock is released even when the monitor crashes."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "monitor.lock").open("a+b") as stream:
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            if not stream.read(1):
+                stream.write(b"0")
+                stream.flush()
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            net = client.networks.get(net_name)
-            net.connect(newc, aliases=aliases if aliases else None)
-        except Exception as e:
-            print(f"[WARN] No pude conectar {name} a red {net_name}: {e}")
+            yield
+        finally:
+            if os.name == "nt":
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream, fcntl.LOCK_UN)
 
-    # Limpiar imagen vieja
+
+def has_healthcheck(config):
+    test = (config.get("Healthcheck") or {}).get("Test") or []
+    return bool(test) and test[0] != "NONE"
+
+
+def wait_healthy(container, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        container.reload()
+        state = container.attrs["State"]
+        if not state.get("Running") or state.get("Restarting"):
+            raise UpdateError(f"{container.name} stopped or restarted during validation.")
+        health = state.get("Health", {}).get("Status")
+        if health == "healthy":
+            return
+        if health == "unhealthy" or not health:
+            raise UpdateError(f"{container.name}: health status {health or 'missing'}.")
+        if time.monotonic() >= deadline:
+            raise UpdateError(f"{container.name}: health check timed out.")
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+
+
+def replacement_config(container, image, transaction_id):
+    """Use Docker's native config to retain ports, limits and security options."""
+    attrs = container.attrs
+    config = deepcopy(attrs["Config"])
+    host = deepcopy(attrs["HostConfig"])
+    labels = config.get("Labels") or {}
+    if labels.get("com.docker.compose.config-hash") or labels.get("com.docker.swarm.service.id"):
+        raise UpdateError("Compose/Swarm containers must be updated by their orchestrator.")
+    if host.get("AutoRemove"):
+        raise UpdateError("AutoRemove containers cannot be rolled back.")
+    if host.get("NetworkMode") not in ("default", "bridge", "host", "none"):
+        raise UpdateError("Custom/shared networks are not supported; no changes made.")
+    if any(net not in ("bridge", "host", "none") for net in attrs["NetworkSettings"]["Networks"]):
+        raise UpdateError("Additional networks are not supported; no changes made.")
+    if host.get("Links") or host.get("VolumesFrom") or any(
+        str(host.get(key, "")).startswith("container:") for key in ("PidMode", "IpcMode")
+    ):
+        raise UpdateError("Shared container dependencies cannot be recreated safely.")
+
+    previous = container.image.attrs["Config"]
+    incoming = image.attrs["Config"]
+    # Inherited defaults should follow the new image, explicit overrides remain.
+    for key in ("Cmd", "Entrypoint", "User", "WorkingDir", "Healthcheck", "StopSignal", "Shell"):
+        if config.get(key) == previous.get(key):
+            config.pop(key, None)
+    def env_dict(items):
+        return dict(item.split("=", 1) for item in items or [] if "=" in item)
+    previous_env = env_dict(previous.get("Env"))
+    environment = env_dict(incoming.get("Env"))
+    environment.update({key: value for key, value in env_dict(config.get("Env")).items()
+                        if previous_env.get(key) != value})
+    config["Env"] = [f"{key}={value}" for key, value in environment.items()]
+    new_labels = dict(incoming.get("Labels") or {})
+    new_labels.update({key: value for key, value in labels.items()
+                       if (previous.get("Labels") or {}).get(key) != value})
+    new_labels[TRANSACTION_LABEL] = transaction_id
+    config["Labels"] = new_labels
+    if config.get("Hostname") == container.id[:12]:
+        config.pop("Hostname")
+
+    # Reuse anonymous and named volumes, preserving explicit --mount options.
+    explicit_mounts = {mount["Target"]: mount for mount in host.get("Mounts") or []}
+    mounts = []
+    for mount in attrs.get("Mounts", []):
+        target = mount["Destination"]
+        if mount["Type"] == "tmpfs":
+            if target in explicit_mounts:
+                mounts.append(explicit_mounts[target])
+            continue  # --tmpfs lives in HostConfig.Tmpfs
+        if target in explicit_mounts:
+            mounts.append(explicit_mounts[target])
+        elif mount["Type"] in ("bind", "volume"):
+            item = {"Type": mount["Type"], "Target": target,
+                    "Source": mount.get("Name") if mount["Type"] == "volume" else mount["Source"],
+                    "ReadOnly": not mount["RW"]}
+            if mount["Type"] == "bind" and mount.get("Propagation"):
+                item["BindOptions"] = {"Propagation": mount["Propagation"]}
+            mounts.append(item)
+        else:
+            raise UpdateError(f"Unsupported mount type: {mount['Type']}")
+    host.pop("Binds", None)
+    host["Mounts"] = mounts
+    config["HostConfig"] = host
+    config["Image"] = image.id  # Pin this transaction to the image actually pulled.
+    effective = dict(incoming)
+    effective.update(config)
+    if not has_healthcheck(effective):
+        raise UpdateError("A Docker HEALTHCHECK is required before automatic updates.")
+    return config
+
+
+def get_optional(client, identifier):
     try:
-        if current_hash:
-            print(f"[INFO] Eliminando imagen antigua: {current_hash}")
-            client.images.remove(current_hash, force=True)
-    except Exception as e:
-        print(f"[WARN] No pude eliminar imagen vieja {current_hash}: {e}")
+        return client.containers.get(identifier)
+    except NotFound:
+        return None
 
 
-def check_and_update_containers(client):
-    print("Contenedores en ejecución:")
-    containers = client.containers.list()
-    if not containers:
-        print("  (ninguno)")
+def candidate_for(client, transaction):
+    candidate = get_optional(client, transaction.get("candidate_id") or transaction["candidate_name"])
+    # After a crash between rename and journal write, also look at the final name.
+    if candidate is None:
+        candidate = get_optional(client, transaction["name"])
+    if candidate and candidate.attrs["Config"].get("Labels", {}).get(TRANSACTION_LABEL) == transaction["id"]:
+        return candidate
+    return None
+
+
+def recover(client, state, health_timeout, stop_timeout):
+    transaction = state.data["transaction"]
+    if not transaction:
         return
+    old = get_optional(client, transaction["old_id"])
+    candidate = candidate_for(client, transaction)
+    if transaction["phase"] == "committed":
+        # Commit was written only after health validation. Cleanup is retryable.
+        if old:
+            old.remove()  # Keep its image and volumes for manual recovery.
+        state.data["transaction"] = None
+        state.save()
+        return
+    if old is None:
+        raise UpdateError("Original container is missing; transaction retained for manual recovery.")
+    if candidate:
+        candidate.stop(timeout=stop_timeout)
+        candidate.remove()
+    old.reload()
+    if old.name != transaction["name"]:
+        old.rename(transaction["name"])
+    old.update(restart_policy=transaction["restart_policy"])
+    old.reload()
+    if not old.attrs["State"]["Running"]:
+        old.start()
+    wait_healthy(old, health_timeout)
+    state.data["failed_images"][transaction["name"]] = transaction["image_id"]
+    state.data["transaction"] = None
+    state.save()
+    LOG.warning("%s: previous container restored and healthy.", transaction["name"])
 
-    for c in containers:
-        if c.name in SKIP_CONTAINERS:
-            continue
-        image_name = c.image.tags[0] if c.image.tags else None
-        print(f"- {c.name}: {image_name or '<sin tag>'}")
 
-    print()
-    for container in containers:
-        if container.name in SKIP_CONTAINERS:
-            continue
-
-        image_name = container.image.tags[0] if container.image.tags else None
-        if not image_name:
-            print(f"[SKIP] {container.name} no tiene imagen etiquetada.")
-            continue
-
-        print(f"[CHECK] {container.name} → {image_name}")
-        up_to_date, current_hash, latest_hash = is_image_up_to_date(client, container, image_name)
-
-        if up_to_date is None:
-            print(f"[WARN] No se pudo verificar {image_name}.")
-            continue
-
-        if up_to_date:
-            print(f"[OK] {image_name} está al día.")
-            continue
-
-        print(f"[UPDATE] {image_name} NO está al día. Re-creando…")
+def replace(client, old, image, state, health_timeout, stop_timeout):
+    old.reload()
+    if not old.attrs["State"].get("Running"):
+        raise UpdateError("Container was stopped; update cancelled.")
+    if old.attrs["State"].get("Health", {}).get("Status") != "healthy":
+        raise UpdateError("The current container must be healthy before an update.")
+    transaction_id = uuid.uuid4().hex
+    config = replacement_config(old, image, transaction_id)
+    name = old.name
+    transaction = {
+        "id": transaction_id, "name": name, "old_id": old.id,
+        "image_id": image.id, "candidate_name": f"{name}-hestia-{transaction_id[:12]}",
+        "restart_policy": deepcopy(old.attrs["HostConfig"]["RestartPolicy"]),
+        "phase": "prepared",
+    }
+    state.data["transaction"] = transaction
+    state.save()
+    try:
+        created = client.api.create_container_from_config(config, name=transaction["candidate_name"])
+        transaction["candidate_id"] = created["Id"]
+        state.save()
+        candidate = client.containers.get(created["Id"])
+        # Prevent the backup competing for ports if Docker restarts mid-update.
+        old.update(restart_policy={"Name": "no"})
+        old.stop(timeout=stop_timeout)
+        old.rename(f"{name}-hestia-backup-{transaction_id[:12]}")
+        candidate.rename(name)
+        candidate.start()
+        wait_healthy(candidate, health_timeout)
+        transaction["phase"] = "committed"
+        state.data["failed_images"].pop(name, None)
         try:
-            conf = extract_full_config(container)
-            recreate_container(client, container, image_name, conf, current_hash)
-        except Exception as e:
-            print(f"[ERROR] Falló actualización de {container.name}: {e}")
+            state.save()
+        except Exception:
+            transaction["phase"] = "prepared"
+            raise
+    except Exception:
+        LOG.exception("%s: update failed; recovering previous container.", name)
+        recover(client, state, health_timeout, stop_timeout)
+        raise
+    recover(client, state, health_timeout, stop_timeout)
+    LOG.info("%s: updated and healthy (%s).", name, image.short_id)
 
 
-def monitor_containers():
-    client = docker.from_env()
-    while True:
-        clear_console()
+def check_once(client, config, state, dry_run=False, retry_failed=False):
+    if state.data["transaction"]:
+        if dry_run:
+            raise UpdateError("Pending recovery exists; run without --dry-run to recover first.")
+        recover(client, state, config["health_timeout"], config["stop_timeout"])
+    success = True
+    for target in config["containers"]:
+        if state.data["transaction"]:
+            break  # Never overwrite a journal whose recovery failed.
+        name = target["name"]
         try:
-            check_and_update_containers(client)
-        except Exception as e:
-            print(f"[ERROR] Ciclo de verificación: {e}")
-        print(f"\nEsperando {CHECK_INTERVAL} segundos para la próxima comprobación...")
-        time.sleep(CHECK_INTERVAL)
+            container = client.containers.get(name)
+            if not container.attrs["State"].get("Running"):
+                LOG.info("%s: stopped; left untouched.", name)
+                continue
+            reference = target.get("image") or container.attrs["Config"]["Image"]
+            LOG.info("%s: checking %s.", name, reference)
+            # Uses the service user's Docker credentials (including GHCR).
+            latest = client.images.pull(reference)
+            if latest.id == container.image.id:
+                LOG.info("%s: already up to date.", name)
+                continue
+            if state.data["failed_images"].get(name) == latest.id and not retry_failed:
+                LOG.warning("%s: this image failed previously; waiting for another image.", name)
+                success = False
+                continue
+            replacement_config(container, latest, "preflight")
+            if dry_run:
+                LOG.info("%s: update available; dry run, container unchanged.", name)
+                continue
+            replace(client, container, latest, state, config["health_timeout"], config["stop_timeout"])
+        except Exception:
+            LOG.exception("%s: check/update failed.", name)
+            success = False
+    return success
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="hestia.json")
+    parser.add_argument("--state-dir", default=".hestia")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Pull and validate without replacing containers.")
+    parser.add_argument("--retry-failed", action="store_true", help="Retry a rejected image (requires --once).")
+    args = parser.parse_args()
+    if args.retry_failed and not args.once:
+        parser.error("--retry-failed requires --once")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    stopped = threading.Event()
+    # Finish or roll back the current transaction before exiting on SIGTERM.
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, lambda *_: stopped.set())
+    try:
+        config = load_config(args.config)
+        with single_instance(args.state_dir):
+            state = State(args.state_dir)
+            with docker.from_env(timeout=120) as client:
+                client.ping()
+                while not stopped.is_set():
+                    success = check_once(client, config, state, args.dry_run, args.retry_failed)
+                    if args.once or args.dry_run:
+                        return 0 if success else 1
+                    stopped.wait(config["interval"])
+        return 0
+    except Exception:
+        LOG.exception("Hestia could not continue.")
+        return 1
 
 
 if __name__ == "__main__":
-    try:
-        monitor_containers()
-    except KeyboardInterrupt:
-        print("\nMonitoreo detenido por el usuario.")
-
-def monitor_containers():
-    client = docker.from_env()
-    while True:
-        clear_console()
-        check_and_update_containers(client)
-        print()
-        print(f"Esperando {CHECK_INTERVAL} segundos para la próxima comprobación...")
-        time.sleep(CHECK_INTERVAL)
-
-
-if __name__ == "__main__":
-    try:
-        monitor_containers()
-    except KeyboardInterrupt:
-        print("\nMonitoreo detenido por el usuario.")
+    raise SystemExit(main())

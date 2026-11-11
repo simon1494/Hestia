@@ -1,12 +1,23 @@
 [Unit]
-Description=Servicio Hestia
-After=network.target
+Description=Hestia Docker image updater
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
-User=server
-WorkingDirectory=/home/server/hestia
-ExecStart=/home/server/hestia/venv/bin/python monitor.py
-Restart=always
+Type=simple
+User=server2
+SupplementaryGroups=docker
+WorkingDirectory=/home/server2/Hestia
+Environment=HOME=/home/server2
+Environment=DOCKER_CONFIG=/home/server2/.docker
+EnvironmentFile=-/home/server2/Hestia/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/server2/Hestia/.venv/bin/python /home/server2/Hestia/monitor.py --config /home/server2/Hestia/hestia.json --state-dir /home/server2/Hestia/.hestia
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=600
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
