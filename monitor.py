@@ -1,7 +1,7 @@
 """Update explicitly selected Docker containers, with health checks and recovery."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from copy import deepcopy
 import json
 import logging
@@ -339,7 +339,7 @@ def main():
         config = load_config(args.config)
         with single_instance(args.state_dir):
             state = State(args.state_dir)
-            with docker.from_env(timeout=120) as client:
+            with closing(docker.from_env(timeout=120)) as client:
                 client.ping()
                 while not stopped.is_set():
                     success = check_once(client, config, state, args.dry_run, args.retry_failed)

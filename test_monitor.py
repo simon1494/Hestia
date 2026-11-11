@@ -165,5 +165,40 @@ class LifecycleTests(unittest.TestCase):
             monitor.load_config(path)
 
 
+class MainTests(unittest.TestCase):
+    def setUp(self):
+        from types import SimpleNamespace
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        config_path = Path(self.directory.name) / "config.json"
+        config_path.write_text(json.dumps({"containers": [{"name": "web"}]}))
+        # Docker SDK 7.1 clients have close(), but no context-manager methods.
+        self.client = SimpleNamespace(ping=MagicMock(), close=MagicMock())
+        patches = (
+            patch("sys.argv", ["monitor.py", "--once", "--dry-run", "--config",
+                               str(config_path), "--state-dir", self.directory.name]),
+            patch.object(monitor.signal, "signal"),
+            patch.object(monitor.logging, "basicConfig"),
+            patch.object(monitor.docker, "from_env", return_value=self.client),
+        )
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_cli_runs_and_closes_client_without_context_manager(self):
+        with patch.object(monitor, "check_once", return_value=True) as check:
+            self.assertEqual(monitor.main(), 0)
+        self.client.ping.assert_called_once_with()
+        self.client.close.assert_called_once_with()
+        check.assert_called_once()
+        self.assertTrue(check.call_args.args[3])  # --dry-run reaches the checker.
+
+    def test_cli_closes_client_when_connection_fails(self):
+        self.client.ping.side_effect = RuntimeError("Docker unavailable")
+        with self.assertLogs("hestia", level="ERROR"):
+            self.assertEqual(monitor.main(), 1)
+        self.client.close.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()
